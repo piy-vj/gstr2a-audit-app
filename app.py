@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
+from openpyxl.styles import PatternFill, Font
 from io import BytesIO
 
 st.set_page_config(page_title="GSTR-2A Automated Audit Platform", layout="wide")
@@ -51,6 +52,10 @@ if uploaded_file is not None:
                     b2b_df[col] = pd.to_numeric(b2b_df[col], errors='coerce').fillna(0.0)
 
             b2b_df['Invoice Date Parsed'] = pd.to_datetime(b2b_df['Invoice Date'], format='%d-%m-%Y', errors='coerce')
+            b2b_df['Cancellation Date Parsed'] = pd.to_datetime(b2b_df['Effective Date of Cancellation'], format='%d-%b-%y', errors='coerce')
+            mask_nat = b2b_df['Cancellation Date Parsed'].isna() & b2b_df['Effective Date of Cancellation'].notna()
+            if mask_nat.any():
+                b2b_df.loc[mask_nat, 'Cancellation Date Parsed'] = pd.to_datetime(b2b_df.loc[mask_nat, 'Effective Date of Cancellation'], format='%d-%b-%Y', errors='coerce')
 
             try:
                 cdnr_raw = pd.read_excel(uploaded_file, sheet_name='CDNR', header=5)
@@ -124,7 +129,7 @@ if uploaded_file is not None:
             cancelled_df = b2b_df[b2b_df['Effective Date of Cancellation'].notna() & (b2b_df['Effective Date of Cancellation'] != '')].copy() if 'Effective Date of Cancellation' in b2b_df.columns else pd.DataFrame()
 
             if not cancelled_df.empty:
-                cancelled_df['Is_Post_Cancellation'] = cancelled_df['Invoice Date Parsed'] > pd.to_datetime(cancelled_df['Effective Date of Cancellation'], format='%d-%m-%Y', errors='coerce')
+                cancelled_df['Is Post Cancellation'] = cancelled_df['Invoice Date Parsed'] > cancelled_df['Cancellation Date Parsed']
                 
                 summary_rows = []
                 for gstin, group in cancelled_df.groupby('GSTIN of Supplier'):
@@ -143,7 +148,7 @@ if uploaded_file is not None:
                     net_cess = group['Cess (Rs.)'].sum()
                     net_total_tax = net_igst + net_cgst + net_sgst + net_cess
                     
-                    tx_post = group['Is_Post_Cancellation'].sum()
+                    tx_post = group['Is Post Cancellation'].sum()
                     tx_pre = num_invoices - tx_post
                     risk_flag = "Normal - all transactions pre-date cancellation" if tx_post == 0 else f"High Risk - {tx_post} transaction(s) post-date cancellation"
 
@@ -168,25 +173,54 @@ if uploaded_file is not None:
             else:
                 cancelled_summary_df = pd.DataFrame(columns=['GSTIN', 'Trade/Legal Name of Supplier', 'Effective Date of Cancellation', 'Financial Years Involved', 'No. of Invoices', 'No. of Credit/Debit Notes', 'Net Taxable Value (Rs.)', 'Net IGST (Rs.)', 'Net CGST (Rs.)', 'Net SGST (Rs.)', 'Net Cess (Rs.)', 'Net Total Tax (Rs.)', 'Transactions Pre-Cancellation', 'Transactions Post-Cancellation', 'Risk Flag'])
 
+            export_cancelled_df = cancelled_df.drop(columns=['Invoice Date Parsed', 'Cancellation Date Parsed'], errors='ignore')
+
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 net_itc_summary.to_excel(writer, sheet_name='Net ITC Summary', index=False)
                 year_wise.to_excel(writer, sheet_name='Year-wise Net ITC', index=False)
                 pd.DataFrame({'Info': ['No B2BA amendments']}).to_excel(writer, sheet_name='Amended Invoices (B2BA Applied)', index=False)
-                if not cancelled_df.empty:
-                    cancelled_df.to_excel(writer, sheet_name='Cancelled Suppliers-Detail', index=False)
+                
+                if not export_cancelled_df.empty:
+                    export_cancelled_df.to_excel(writer, sheet_name='Cancelled Suppliers-Detail', index=False)
                     cancelled_summary_df.to_excel(writer, sheet_name='Cancelled Suppliers-Summary', index=False)
                 else:
                     pd.DataFrame({'Info': ['No cancelled suppliers']}).to_excel(writer, sheet_name='Cancelled Suppliers-Detail', index=False)
                     pd.DataFrame({'Info': ['No cancelled suppliers']}).to_excel(writer, sheet_name='Cancelled Suppliers-Summary', index=False)
-                b2b_df.to_excel(writer, sheet_name='B2B (All Years)', index=False)
+                
+                b2b_df.drop(columns=['Invoice Date Parsed', 'Cancellation Date Parsed'], errors='ignore').to_excel(writer, sheet_name='B2B (All Years)', index=False)
                 if not cdnr_df.empty:
                     cdnr_df.to_excel(writer, sheet_name='CDNR (All Years)', index=False)
                 else:
                     pd.DataFrame({'Info': ['No CDNR']}).to_excel(writer, sheet_name='CDNR (All Years)', index=False)
 
-            processed_data = output.getvalue()
-            st.success("Audit Report Generated Successfully with Full Cancelled Suppliers Summary Columns!")
+            output.seek(0)
+            wb = openpyxl.load_workbook(output)
+            if 'Cancelled Suppliers-Detail' in wb.sheetnames:
+                ws_det = wb['Cancelled Suppliers-Detail']
+                red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+                red_font = Font(color='9C0006')
+                
+                col_idx = None
+                for col in range(1, ws_det.max_column + 1):
+                    if ws_det.cell(row=1, column=col).value == 'Is Post Cancellation':
+                        col_idx = col
+                        break
+                
+                if col_idx:
+                    for row in range(2, ws_det.max_row + 1):
+                        val = ws_det.cell(row=row, column=col_idx).value
+                        if val == True or val == 'True' or val == 1:
+                            for c in range(1, ws_det.max_column + 1):
+                                ws_det.cell(row=row, column=c).fill = red_fill
+                                ws_det.cell(row=row, column=c).font = red_font
+
+            final_output = BytesIO()
+            wb.save(final_output)
+            final_output.seek(0)
+
+            processed_data = final_output.getvalue()
+            st.success("Audit Report Generated Successfully with Correct Cancellation Flags & Highlights!")
             st.download_button(label="📥 Download Audit-Ready Excel Report", data=processed_data, file_name="GSTR2A_Audit_Ready_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except Exception as e:
             st.error(f"Error processing file: {e}")
