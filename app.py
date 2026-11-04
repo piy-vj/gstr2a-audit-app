@@ -12,7 +12,7 @@ st.markdown("Upload your raw GSTR-2A annual Excel file downloaded from the GST p
 uploaded_file = st.file_uploader("Upload GSTR-2A Excel File (.xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
-    with st.spinner("Processing GSTR-2A data... Please wait."):
+    with st.spinner("Processing GSTR-2A data with Advanced Compliance Checks... Please wait."):
         try:
             read_me = pd.read_excel(uploaded_file, sheet_name='Read me', header=None)
             fy = read_me.iloc[2, 4] if len(read_me) > 2 else '2022-23'
@@ -57,6 +57,86 @@ if uploaded_file is not None:
             if mask_nat.any():
                 b2b_df.loc[mask_nat, 'Cancellation Date Parsed'] = pd.to_datetime(b2b_df.loc[mask_nat, 'Effective Date of Cancellation'], format='%d-%b-%Y', errors='coerce')
 
+            # --- NEW CHECK 1: Place of Supply & Tax Head Compliance ---
+            def check_tax_head(row):
+                gstin = str(row['GSTIN of Supplier']).strip()
+                igst = row['IGST (Rs.)']
+                cgst = row['CGST (Rs.)']
+                sgst = row['SGST (Rs.)']
+                
+                is_punjab = gstin.startswith('03')
+                if is_punjab:
+                    if igst > 0 and (cgst == 0 and sgst == 0):
+                        return "Violation: Intra-state Supplier (03) charged IGST instead of CGST/SGST"
+                    elif igst > 0:
+                        return "Mixed/Incorrect Tax Head Charged"
+                    else:
+                        return "Compliant (Intra-State CGST/SGST)"
+                else:
+                    if (cgst > 0 or sgst > 0) and igst == 0:
+                        return "Violation: Inter-state Supplier charged CGST/SGST instead of IGST"
+                    elif cgst > 0 or sgst > 0:
+                        return "Mixed/Incorrect Tax Head Charged"
+                    else:
+                        return "Compliant (Inter-State IGST)"
+
+            b2b_df['Tax Head Compliance Status'] = b2b_df.apply(check_tax_head, axis=1)
+
+            # --- NEW CHECK 2: Invoice Date vs GSTR-2A Financial Year Compliance ---
+            # Parse Financial Year e.g., '2022-23' -> start date 2022-04-01, end date 2023-03-31
+            fy_parts = str(fy).split('-')
+            fy_start_year = int(fy_parts[0]) if len(fy_parts) > 0 and fy_parts[0].isdigit() else 2022
+            fy_start_date = pd.Timestamp(year=fy_start_year, month=4, day=1)
+            fy_end_date = pd.Timestamp(year=fy_start_year + 1, month=3, day=31)
+
+            def check_invoice_period(row):
+                inv_dt = row['Invoice Date Parsed']
+                if pd.isna(inv_dt):
+                    return "Invalid Invoice Date"
+                if inv_dt < fy_start_date or inv_dt > fy_end_date:
+                    return f"Violation: Invoice Date ({row['Invoice Date']}) outside GSTR-2A FY {fy}"
+                return "Compliant within FY"
+
+            b2b_df['Invoice Period Compliance Status'] = b2b_df.apply(check_invoice_period, axis=1)
+
+            # Read B2BA sheet
+            try:
+                b2ba_raw = pd.read_excel(uploaded_file, sheet_name='B2BA', header=5)
+                b2ba_cols = {
+                    b2ba_raw.columns[0]: 'GSTR2A Period',
+                    b2ba_raw.columns[1]: 'GSTIN of Supplier',
+                    b2ba_raw.columns[2]: 'Trade/Legal Name of Supplier',
+                    b2ba_raw.columns[3]: 'Original Invoice Number',
+                    b2ba_raw.columns[4]: 'Original Invoice Date',
+                    b2ba_raw.columns[5]: 'Revised Invoice Number',
+                    b2ba_raw.columns[6]: 'Revised Invoice Date',
+                    b2ba_raw.columns[7]: 'Invoice Value (Rs.)',
+                    b2ba_raw.columns[8]: 'Place of Supply',
+                    b2ba_raw.columns[9]: 'Reverse Charge',
+                    b2ba_raw.columns[10]: 'Rate (%)',
+                    b2ba_raw.columns[11]: 'Taxable Value (Rs.)',
+                    b2ba_raw.columns[12]: 'IGST (Rs.)',
+                    b2ba_raw.columns[13]: 'CGST (Rs.)',
+                    b2ba_raw.columns[14]: 'SGST (Rs.)',
+                    b2ba_raw.columns[15]: 'Cess (Rs.)',
+                    b2ba_raw.columns[16]: 'GSTR-1 Filing Status',
+                    b2ba_raw.columns[17]: 'GSTR-1 Filing Date',
+                    b2ba_raw.columns[18]: 'GSTR-1 Filing Period',
+                    b2ba_raw.columns[19]: 'GSTR-3B Filing Status',
+                    b2ba_raw.columns[20]: 'Original Tax Period in which reported',
+                    b2ba_raw.columns[21]: 'Tax Period in which Amended',
+                    b2ba_raw.columns[22]: 'Source',
+                    b2ba_raw.columns[23]: 'IRN',
+                    b2ba_raw.columns[24]: 'IRN Date'
+                }
+                b2ba_df = b2ba_raw.rename(columns=b2ba_cols).copy()
+                b2ba_df['Financial Year'] = fy
+                for col in ['Taxable Value (Rs.)', 'IGST (Rs.)', 'CGST (Rs.)', 'SGST (Rs.)', 'Cess (Rs.)', 'Invoice Value (Rs.)']:
+                    if col in b2ba_df.columns:
+                        b2ba_df[col] = pd.to_numeric(b2ba_df[col], errors='coerce').fillna(0.0)
+            except:
+                b2ba_df = pd.DataFrame()
+
             try:
                 cdnr_raw = pd.read_excel(uploaded_file, sheet_name='CDNR', header=5)
                 cdnr_cols = {
@@ -92,9 +172,17 @@ if uploaded_file is not None:
             except:
                 cdnr_df = pd.DataFrame()
 
+            # Group B2B for Net ITC Summary
             b2b_grouped = b2b_df.groupby(['Financial Year', 'GSTIN of Supplier', 'Trade/Legal Name of Supplier']).agg({
                 'Taxable Value (Rs.)': 'sum', 'IGST (Rs.)': 'sum', 'CGST (Rs.)': 'sum', 'SGST (Rs.)': 'sum', 'Cess (Rs.)': 'sum', 'Invoice Value (Rs.)': 'sum'
             }).reset_index().rename(columns={'Taxable Value (Rs.)': 'Gross Purchases - Taxable Value (Rs.)', 'Invoice Value (Rs.)': 'Gross Total Value (Rs.)'})
+
+            if not b2ba_df.empty and 'GSTIN of Supplier' in b2ba_df.columns:
+                b2ba_grouped = b2ba_df.groupby(['Financial Year', 'GSTIN of Supplier']).agg({
+                    'Taxable Value (Rs.)': 'sum', 'IGST (Rs.)': 'sum', 'CGST (Rs.)': 'sum', 'SGST (Rs.)': 'sum', 'Cess (Rs.)': 'sum', 'Invoice Value (Rs.)': 'sum'
+                }).reset_index().rename(columns={'Taxable Value (Rs.)': 'B2BA_Taxable', 'IGST (Rs.)': 'B2BA_IGST', 'CGST (Rs.)': 'B2BA_CGST', 'SGST (Rs.)': 'B2BA_SGST', 'Cess (Rs.)': 'B2BA_Cess', 'Invoice Value (Rs.)': 'B2BA_TotalValue'})
+            else:
+                b2ba_grouped = pd.DataFrame(columns=['Financial Year', 'GSTIN of Supplier', 'B2BA_Taxable', 'B2BA_IGST', 'B2BA_CGST', 'B2BA_SGST', 'B2BA_Cess', 'B2BA_TotalValue'])
 
             if not cdnr_df.empty and 'Note Type' in cdnr_df.columns:
                 cr_notes = cdnr_df[cdnr_df['Note Type'].str.upper().isin(['C', 'CREDIT'])].groupby(['Financial Year', 'GSTIN of Supplier']).agg({
@@ -108,24 +196,28 @@ if uploaded_file is not None:
                 cr_notes = pd.DataFrame(columns=['Financial Year', 'GSTIN of Supplier', 'CN_Taxable', 'CN_IGST', 'CN_CGST', 'CN_SGST', 'CN_Cess'])
                 dr_notes = pd.DataFrame(columns=['Financial Year', 'GSTIN of Supplier', 'DN_Taxable', 'DN_IGST', 'DN_CGST', 'DN_SGST', 'DN_Cess'])
 
-            net_itc = b2b_grouped.merge(cr_notes, on=['Financial Year', 'GSTIN of Supplier'], how='left').merge(dr_notes, on=['Financial Year', 'GSTIN of Supplier'], how='left').fillna(0)
+            net_itc = b2b_grouped.merge(cr_notes, on=['Financial Year', 'GSTIN of Supplier'], how='left').merge(dr_notes, on=['Financial Year', 'GSTIN of Supplier'], how='left').merge(b2ba_grouped, on=['Financial Year', 'GSTIN of Supplier'], how='left').fillna(0)
+            
             net_itc['Less: Credit Notes - Taxable Value (Rs.)'] = net_itc['CN_Taxable']
             net_itc['Add: Debit Notes - Taxable Value (Rs.)'] = net_itc['DN_Taxable']
-            net_itc['Net Taxable Value (Rs.)'] = net_itc['Gross Purchases - Taxable Value (Rs.)'] - net_itc['Less: Credit Notes - Taxable Value (Rs.)'] + net_itc['Add: Debit Notes - Taxable Value (Rs.)']
-            net_itc['Net IGST (Rs.)'] = net_itc['IGST (Rs.)'] - net_itc['CN_IGST'] + net_itc['DN_IGST']
-            net_itc['Net CGST (Rs.)'] = net_itc['CGST (Rs.)'] - net_itc['CN_CGST'] + net_itc['DN_CGST']
-            net_itc['Net SGST (Rs.)'] = net_itc['SGST (Rs.)'] - net_itc['CN_SGST'] + net_itc['DN_SGST']
-            net_itc['Net Cess (Rs.)'] = net_itc['Cess (Rs.)'] - net_itc['CN_Cess'] + net_itc['DN_Cess']
+            net_itc['Amendments if any (B2BA Taxable Value)'] = net_itc['B2BA_Taxable']
+            
+            net_itc['Net Taxable Value (Rs.)'] = net_itc['Gross Purchases - Taxable Value (Rs.)'] - net_itc['Less: Credit Notes - Taxable Value (Rs.)'] + net_itc['Add: Debit Notes - Taxable Value (Rs.)'] + net_itc['Amendments if any (B2BA Taxable Value)']
+            net_itc['Net IGST (Rs.)'] = net_itc['IGST (Rs.)'] - net_itc['CN_IGST'] + net_itc['DN_IGST'] + net_itc['B2BA_IGST']
+            net_itc['Net CGST (Rs.)'] = net_itc['CGST (Rs.)'] - net_itc['CN_CGST'] + net_itc['DN_CGST'] + net_itc['B2BA_CGST']
+            net_itc['Net SGST (Rs.)'] = net_itc['SGST (Rs.)'] - net_itc['CN_SGST'] + net_itc['DN_SGST'] + net_itc['B2BA_SGST']
+            net_itc['Net Cess (Rs.)'] = net_itc['Cess (Rs.)'] - net_itc['CN_Cess'] + net_itc['DN_Cess'] + net_itc['B2BA_Cess']
             net_itc['Net Total Tax (Rs.)'] = net_itc['Net IGST (Rs.)'] + net_itc['Net CGST (Rs.)'] + net_itc['Net SGST (Rs.)'] + net_itc['Net Cess (Rs.)']
             net_itc['Net Total Value (Rs.)'] = net_itc['Net Taxable Value (Rs.)'] + net_itc['Net Total Tax (Rs.)']
 
-            summary_cols = ['Financial Year', 'GSTIN of Supplier', 'Trade/Legal Name of Supplier', 'Gross Purchases - Taxable Value (Rs.)', 'Less: Credit Notes - Taxable Value (Rs.)', 'Add: Debit Notes - Taxable Value (Rs.)', 'Net Taxable Value (Rs.)', 'Net IGST (Rs.)', 'Net CGST (Rs.)', 'Net SGST (Rs.)', 'Net Cess (Rs.)', 'Net Total Tax (Rs.)', 'Net Total Value (Rs.)']
+            summary_cols = ['Financial Year', 'GSTIN of Supplier', 'Trade/Legal Name of Supplier', 'Gross Purchases - Taxable Value (Rs.)', 'Less: Credit Notes - Taxable Value (Rs.)', 'Add: Debit Notes - Taxable Value (Rs.)', 'Amendments if any (B2BA Taxable Value)', 'Net Taxable Value (Rs.)', 'Net IGST (Rs.)', 'Net CGST (Rs.)', 'Net SGST (Rs.)', 'Net Cess (Rs.)', 'Net Total Tax (Rs.)', 'Net Total Value (Rs.)']
             net_itc_summary = net_itc[summary_cols]
 
             year_wise = net_itc_summary.groupby('Financial Year').agg({
-                'Gross Purchases - Taxable Value (Rs.)': 'sum', 'Less: Credit Notes - Taxable Value (Rs.)': 'sum', 'Add: Debit Notes - Taxable Value (Rs.)': 'sum', 'Net Taxable Value (Rs.)': 'sum', 'Net IGST (Rs.)': 'sum', 'Net CGST (Rs.)': 'sum', 'Net SGST (Rs.)': 'sum', 'Net Cess (Rs.)': 'sum', 'Net Total Tax (Rs.)': 'sum', 'Net Total Value (Rs.)': 'sum'
+                'Gross Purchases - Taxable Value (Rs.)': 'sum', 'Less: Credit Notes - Taxable Value (Rs.)': 'sum', 'Add: Debit Notes - Taxable Value (Rs.)': 'sum', 'Amendments if any (B2BA Taxable Value)': 'sum', 'Net Taxable Value (Rs.)': 'sum', 'Net IGST (Rs.)': 'sum', 'Net CGST (Rs.)': 'sum', 'Net SGST (Rs.)': 'sum', 'Net Cess (Rs.)': 'sum', 'Net Total Tax (Rs.)': 'sum', 'Net Total Value (Rs.)': 'sum'
             }).reset_index()
 
+            # Cancelled Suppliers Detail & Summary
             cancelled_df = b2b_df[b2b_df['Effective Date of Cancellation'].notna() & (b2b_df['Effective Date of Cancellation'] != '')].copy() if 'Effective Date of Cancellation' in b2b_df.columns else pd.DataFrame()
 
             if not cancelled_df.empty:
@@ -173,13 +265,21 @@ if uploaded_file is not None:
             else:
                 cancelled_summary_df = pd.DataFrame(columns=['GSTIN', 'Trade/Legal Name of Supplier', 'Effective Date of Cancellation', 'Financial Years Involved', 'No. of Invoices', 'No. of Credit/Debit Notes', 'Net Taxable Value (Rs.)', 'Net IGST (Rs.)', 'Net CGST (Rs.)', 'Net SGST (Rs.)', 'Net Cess (Rs.)', 'Net Total Tax (Rs.)', 'Transactions Pre-Cancellation', 'Transactions Post-Cancellation', 'Risk Flag'])
 
+            # Filter dataframes for the two new dedicated compliance sheets
+            pos_compliance_df = b2b_df.drop(columns=['Invoice Date Parsed', 'Cancellation Date Parsed'], errors='ignore')
+            invoice_period_df = b2b_df.drop(columns=['Invoice Date Parsed', 'Cancellation Date Parsed'], errors='ignore')
+
             export_cancelled_df = cancelled_df.drop(columns=['Invoice Date Parsed', 'Cancellation Date Parsed'], errors='ignore')
 
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 net_itc_summary.to_excel(writer, sheet_name='Net ITC Summary', index=False)
                 year_wise.to_excel(writer, sheet_name='Year-wise Net ITC', index=False)
-                pd.DataFrame({'Info': ['No B2BA amendments']}).to_excel(writer, sheet_name='Amended Invoices (B2BA Applied)', index=False)
+                
+                if not b2ba_df.empty:
+                    b2ba_df.to_excel(writer, sheet_name='Amended Invoices (B2BA)', index=False)
+                else:
+                    pd.DataFrame({'Info': ['No B2BA amendments']}).to_excel(writer, sheet_name='Amended Invoices (B2BA)', index=False)
                 
                 if not export_cancelled_df.empty:
                     export_cancelled_df.to_excel(writer, sheet_name='Cancelled Suppliers-Detail', index=False)
@@ -187,26 +287,31 @@ if uploaded_file is not None:
                 else:
                     pd.DataFrame({'Info': ['No cancelled suppliers']}).to_excel(writer, sheet_name='Cancelled Suppliers-Detail', index=False)
                     pd.DataFrame({'Info': ['No cancelled suppliers']}).to_excel(writer, sheet_name='Cancelled Suppliers-Summary', index=False)
-                
+
+                # Two New Compliance Sheets
+                pos_compliance_df.to_excel(writer, sheet_name='Place of Supply Check', index=False)
+                invoice_period_df.to_excel(writer, sheet_name='Invoice Period Compliance', index=False)
+
                 b2b_df.drop(columns=['Invoice Date Parsed', 'Cancellation Date Parsed'], errors='ignore').to_excel(writer, sheet_name='B2B (All Years)', index=False)
                 if not cdnr_df.empty:
                     cdnr_df.to_excel(writer, sheet_name='CDNR (All Years)', index=False)
                 else:
                     pd.DataFrame({'Info': ['No CDNR']}).to_excel(writer, sheet_name='CDNR (All Years)', index=False)
 
+            # Post-processing with openpyxl to apply highlights
             output.seek(0)
             wb = openpyxl.load_workbook(output)
+            red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+            red_font = Font(color='9C0006')
+
+            # 1. Highlight Cancelled Detail risky rows
             if 'Cancelled Suppliers-Detail' in wb.sheetnames:
                 ws_det = wb['Cancelled Suppliers-Detail']
-                red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
-                red_font = Font(color='9C0006')
-                
                 col_idx = None
                 for col in range(1, ws_det.max_column + 1):
                     if ws_det.cell(row=1, column=col).value == 'Is Post Cancellation':
                         col_idx = col
                         break
-                
                 if col_idx:
                     for row in range(2, ws_det.max_row + 1):
                         val = ws_det.cell(row=row, column=col_idx).value
@@ -215,12 +320,44 @@ if uploaded_file is not None:
                                 ws_det.cell(row=row, column=c).fill = red_fill
                                 ws_det.cell(row=row, column=c).font = red_font
 
+            # 2. Highlight Place of Supply Check violations
+            if 'Place of Supply Check' in wb.sheetnames:
+                ws_pos = wb['Place of Supply Check']
+                pos_col_idx = None
+                for col in range(1, ws_pos.max_column + 1):
+                    if ws_pos.cell(row=1, column=col).value == 'Tax Head Compliance Status':
+                        pos_col_idx = col
+                        break
+                if pos_col_idx:
+                    for row in range(2, ws_pos.max_row + 1):
+                        val = str(ws_pos.cell(row=row, column=pos_col_idx).value)
+                        if "Violation" in val:
+                            for c in range(1, ws_pos.max_column + 1):
+                                ws_pos.cell(row=row, column=c).fill = red_fill
+                                ws_pos.cell(row=row, column=c).font = red_font
+
+            # 3. Highlight Invoice Period Compliance violations
+            if 'Invoice Period Compliance' in wb.sheetnames:
+                ws_per = wb['Invoice Period Compliance']
+                per_col_idx = None
+                for col in range(1, ws_per.max_column + 1):
+                    if ws_per.cell(row=1, column=col).value == 'Invoice Period Compliance Status':
+                        per_col_idx = col
+                        break
+                if per_col_idx:
+                    for row in range(2, ws_per.max_row + 1):
+                        val = str(ws_per.cell(row=row, column=per_col_idx).value)
+                        if "Violation" in val or "Invalid" in val:
+                            for c in range(1, ws_per.max_column + 1):
+                                ws_per.cell(row=row, column=c).fill = red_fill
+                                ws_per.cell(row=row, column=c).font = red_font
+
             final_output = BytesIO()
             wb.save(final_output)
             final_output.seek(0)
 
             processed_data = final_output.getvalue()
-            st.success("Audit Report Generated Successfully with Correct Cancellation Flags & Highlights!")
+            st.success("Audit Report Generated Successfully with Place of Supply & Invoice Period Compliance Sheets!")
             st.download_button(label="📥 Download Audit-Ready Excel Report", data=processed_data, file_name="GSTR2A_Audit_Ready_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except Exception as e:
             st.error(f"Error processing file: {e}")
